@@ -4,7 +4,7 @@ Configuration management for the pipeline
 
 import yaml
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -58,7 +58,7 @@ class RedisConfig(BaseModel):
     host: str = "localhost"
     port: int = 6379
     db: int = 0
-    password: str = None
+    password: Optional[str] = None
     max_connections: int = 100
     socket_timeout: float = 1.0
     socket_connect_timeout: float = 1.0

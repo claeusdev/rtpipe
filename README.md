@@ -91,12 +91,55 @@ docker-compose up -d
 # Initialize databases
 uv run python scripts/setup_db.py
 
+# Generate test data (optional)
+uv run python scripts/generate_test_data.py
+
 # Start data pipeline
 uv run python main.py
 
 # View dashboard
 open http://localhost:8080
 ```
+
+## Database Setup
+
+The pipeline requires InfluxDB and Redis to be properly initialized before starting:
+
+```bash
+# Initialize all databases
+uv run python scripts/setup_db.py
+
+# Or initialize specific databases
+uv run python scripts/setup_db.py --influxdb-only
+uv run python scripts/setup_db.py --redis-only
+```
+
+This script will:
+- Create InfluxDB buckets with proper retention policies
+- Set up Redis data structures for symbols and metadata
+- Test connectivity to both databases
+- Provide detailed logging of the initialization process
+
+## Test Data Generation
+
+For development and testing, you can generate sample market data:
+
+```bash
+# Generate all test data
+uv run python scripts/generate_test_data.py
+
+# Generate data for specific symbol
+uv run python scripts/generate_test_data.py --symbol BTC-USD --count 1000
+
+# Custom output directory
+uv run python scripts/generate_test_data.py --output-dir my_test_data
+```
+
+Generated data includes:
+- **Trade Data**: Realistic trade records with price movements
+- **Order Books**: Sample bid/ask data for each symbol
+- **Ticker Data**: 24h/30d volume and price statistics
+- **Configuration**: Summary of generated data
 
 ## Performance Benchmarks
 
@@ -143,15 +186,19 @@ uv run pytest tests/integration/
 # Performance tests
 uv run python tests/performance/load_test.py
 
-# Generate test data
+# Generate test data for testing
 uv run python scripts/generate_test_data.py
+
+# Test database connectivity
+uv run python scripts/setup_db.py --influxdb-only
+uv run python scripts/setup_db.py --redis-only
 ```
 
 ## Data Sources
 
 Supported exchanges:
 - Binance (WebSocket)
-- Coinbase Pro (WebSocket)
+- Coinbase Advanced Trade (WebSocket) - using coinbase-advanced-py
 - Kraken (WebSocket)
 - Custom exchange adapters
 
@@ -220,6 +267,60 @@ pip install -e ".[dev,test]"
 
 # Run tests
 pytest
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**Database Connection Errors:**
+```bash
+# Check if databases are running
+docker-compose ps
+
+# Restart databases
+docker-compose restart influxdb redis
+
+# Reinitialize databases
+uv run python scripts/setup_db.py
+```
+
+**Dependency Conflicts:**
+```bash
+# Clean and reinstall dependencies
+rm -rf .venv uv.lock
+uv sync
+```
+
+**Port Conflicts:**
+```bash
+# Check what's using ports
+lsof -i :8000  # API port
+lsof -i :9090  # Prometheus port
+lsof -i :3000  # Grafana port
+```
+
+**Docker Issues:**
+```bash
+# Clean Docker resources
+docker-compose down -v
+docker system prune -f
+docker-compose up -d
+```
+
+### Logs and Debugging
+
+```bash
+# View application logs
+uv run python main.py --log-level DEBUG
+
+# View Docker logs
+docker-compose logs -f kafka
+docker-compose logs -f influxdb
+docker-compose logs -f redis
+
+# Check Prometheus targets
+open http://localhost:9090/targets
 ```
 
 ## Contributing

@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Any
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, generate_latest, start_http_server
 import structlog
 
 
@@ -19,6 +19,9 @@ class MetricsCollector:
     def __init__(self, config):
         self.config = config
         self.logger = logging.getLogger(__name__)
+        
+        # Use a custom registry to avoid conflicts
+        self.registry = CollectorRegistry()
         
         # Prometheus metrics
         self.counters = {}
@@ -38,69 +41,87 @@ class MetricsCollector:
     def _initialize_metrics(self):
         """Initialize Prometheus metrics"""
         
+        # Clear existing metrics to avoid duplicates
+        self.counters.clear()
+        self.histograms.clear()
+        self.gauges.clear()
+        
+        # Use unique metric names with instance ID to avoid conflicts
+        instance_id = id(self)
+        
         # Counters
         self.counters['messages_processed'] = Counter(
-            'messages_processed_total',
+            f'messages_processed_total_{instance_id}',
             'Total number of messages processed',
-            ['exchange', 'type']
+            ['exchange', 'type'],
+            registry=self.registry
         )
         
         self.counters['processing_errors'] = Counter(
-            'processing_errors_total',
+            f'processing_errors_total_{instance_id}',
             'Total number of processing errors',
-            ['exchange', 'error_type']
+            ['exchange', 'error_type'],
+            registry=self.registry
         )
         
         self.counters['reconnects'] = Counter(
-            'exchange_reconnects_total',
+            f'exchange_reconnects_total_{instance_id}',
             'Total number of exchange reconnects',
-            ['exchange']
+            ['exchange'],
+            registry=self.registry
         )
         
         # Histograms for latency
         self.histograms['processing_latency'] = Histogram(
-            'processing_latency_seconds',
+            f'processing_latency_seconds_{instance_id}',
             'Message processing latency',
             ['operation'],
-            buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+            buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
+            registry=self.registry
         )
         
         self.histograms['storage_latency'] = Histogram(
-            'storage_latency_seconds',
+            f'storage_latency_seconds_{instance_id}',
             'Storage operation latency',
             ['storage_type'],
-            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+            registry=self.registry
         )
         
         # Gauges
         self.gauges['buffer_depth'] = Gauge(
-            'buffer_depth',
+            f'buffer_depth_{instance_id}',
             'Current buffer depth',
-            ['buffer_type']
+            ['buffer_type'],
+            registry=self.registry
         )
         
         self.gauges['connection_status'] = Gauge(
-            'connection_status',
+            f'connection_status_{instance_id}',
             'Exchange connection status (1=connected, 0=disconnected)',
-            ['exchange']
+            ['exchange'],
+            registry=self.registry
         )
         
         self.gauges['queue_depth'] = Gauge(
-            'queue_depth',
+            f'queue_depth_{instance_id}',
             'Queue depth for different components',
-            ['component']
+            ['component'],
+            registry=self.registry
         )
         
         self.gauges['memory_usage'] = Gauge(
-            'memory_usage_bytes',
+            f'memory_usage_bytes_{instance_id}',
             'Memory usage in bytes',
-            ['component']
+            ['component'],
+            registry=self.registry
         )
         
         self.gauges['cpu_usage'] = Gauge(
-            'cpu_usage_percent',
+            f'cpu_usage_percent_{instance_id}',
             'CPU usage percentage',
-            ['component']
+            ['component'],
+            registry=self.registry
         )
     
     async def initialize(self):
