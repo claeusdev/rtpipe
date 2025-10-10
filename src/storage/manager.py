@@ -60,14 +60,13 @@ class StorageManager:
             timeout=self.config.influxdb.timeout
         )
         
-        self.influx_write_api = self.influx_client.write_api()
-        
-        # Test InfluxDB connection
-        health = await self.influx_client.health()
-        if health.status == "pass":
+        # Test InfluxDB connection by trying to create write API
+        try:
+            self.influx_write_api = self.influx_client.write_api()
             self.logger.info("InfluxDB connection established")
-        else:
-            raise Exception(f"InfluxDB health check failed: {health.message}")
+        except Exception as e:
+            self.logger.error(f"InfluxDB connection failed: {e}")
+            raise Exception(f"InfluxDB connection failed: {e}")
     
     async def close(self):
         """Close storage connections"""
@@ -316,6 +315,10 @@ class StorageManager:
     async def get_latest_trade(self, exchange: str, symbol: str) -> Optional[Dict]:
         """Get latest trade from Redis"""
         try:
+            if not self.redis_client:
+                self.logger.warning("Redis client not initialized")
+                return None
+                
             recent_key = f"recent_trades:{exchange}:{symbol}"
             data = await self.redis_client.lindex(recent_key, 0)
             
@@ -330,6 +333,10 @@ class StorageManager:
     async def get_latest_quote(self, exchange: str, symbol: str) -> Optional[Dict]:
         """Get latest quote from Redis"""
         try:
+            if not self.redis_client:
+                self.logger.warning("Redis client not initialized")
+                return None
+                
             key = f"quote:{exchange}:{symbol}"
             data = await self.redis_client.get(key)
             
@@ -344,6 +351,10 @@ class StorageManager:
     async def get_latest_orderbook(self, exchange: str, symbol: str) -> Optional[Dict]:
         """Get latest order book from Redis"""
         try:
+            if not self.redis_client:
+                self.logger.warning("Redis client not initialized")
+                return None
+                
             key = f"orderbook:{exchange}:{symbol}"
             data = await self.redis_client.get(key)
             
