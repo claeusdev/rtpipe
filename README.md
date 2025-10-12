@@ -1,6 +1,5 @@
 # Real-Time Market Data Pipeline
 
-## Overview
 High-performance real-time market data processing system designed for low-latency trading applications. This system ingests, processes, and distributes market data with sub-millisecond latency requirements.
 
 ## Architecture
@@ -32,12 +31,13 @@ Market Data Sources → WebSocket Client → Kafka → Stream Processor → Infl
 - Market data quality validation
 - Anomaly detection and alerting
 
+<!--
 ### Reliability
 - Fault-tolerant architecture
 - Data replay capabilities
 - Comprehensive error handling
 - Health monitoring and alerting
-
+-->
 ## Technology Stack
 - **Python 3.11+**: Core application logic
 - **uv**: Fast Python package manager and project manager
@@ -48,6 +48,7 @@ Market Data Sources → WebSocket Client → Kafka → Stream Processor → Infl
 - **asyncio**: Asynchronous programming
 - **Docker**: Containerization
 
+<!--
 ## Why uv?
 
 This project uses [uv](https://github.com/astral-sh/uv) instead of pip for faster dependency management:
@@ -65,7 +66,7 @@ If you're migrating from pip, simply replace:
 - `pip install -r requirements.txt` → `uv sync`
 - `pip install package` → `uv add package`
 - `python script.py` → `uv run python script.py`
-
+-->
 ## Getting Started
 
 ### Prerequisites
