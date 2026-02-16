@@ -4,13 +4,10 @@ Metrics collection and monitoring
 
 import asyncio
 import logging
-import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, Any, Optional
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
 
-from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, generate_latest, start_http_server
-import structlog
+from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, start_http_server
 
 
 class MetricsCollector:
@@ -34,6 +31,7 @@ class MetricsCollector:
         self.gauge_data = defaultdict(float)
         
         self.is_running = False
+        self._tasks: list[asyncio.Task] = []
         
         # Initialize Prometheus metrics
         self._initialize_metrics()
@@ -46,26 +44,23 @@ class MetricsCollector:
         self.histograms.clear()
         self.gauges.clear()
         
-        # Use unique metric names with instance ID to avoid conflicts
-        instance_id = id(self)
-        
         # Counters
         self.counters['messages_processed'] = Counter(
-            f'messages_processed_total_{instance_id}',
+            'messages_processed_total',
             'Total number of messages processed',
             ['exchange', 'type'],
             registry=self.registry
         )
         
         self.counters['processing_errors'] = Counter(
-            f'processing_errors_total_{instance_id}',
+            'processing_errors_total',
             'Total number of processing errors',
             ['exchange', 'error_type'],
             registry=self.registry
         )
         
         self.counters['reconnects'] = Counter(
-            f'exchange_reconnects_total_{instance_id}',
+            'exchange_reconnects_total',
             'Total number of exchange reconnects',
             ['exchange'],
             registry=self.registry
@@ -73,7 +68,7 @@ class MetricsCollector:
         
         # Histograms for latency
         self.histograms['processing_latency'] = Histogram(
-            f'processing_latency_seconds_{instance_id}',
+            'processing_latency_seconds',
             'Message processing latency',
             ['operation'],
             buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
@@ -81,7 +76,7 @@ class MetricsCollector:
         )
         
         self.histograms['storage_latency'] = Histogram(
-            f'storage_latency_seconds_{instance_id}',
+            'storage_latency_seconds',
             'Storage operation latency',
             ['storage_type'],
             buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
@@ -90,35 +85,35 @@ class MetricsCollector:
         
         # Gauges
         self.gauges['buffer_depth'] = Gauge(
-            f'buffer_depth_{instance_id}',
+            'buffer_depth',
             'Current buffer depth',
             ['buffer_type'],
             registry=self.registry
         )
         
         self.gauges['connection_status'] = Gauge(
-            f'connection_status_{instance_id}',
+            'connection_status',
             'Exchange connection status (1=connected, 0=disconnected)',
             ['exchange'],
             registry=self.registry
         )
         
         self.gauges['queue_depth'] = Gauge(
-            f'queue_depth_{instance_id}',
+            'queue_depth',
             'Queue depth for different components',
             ['component'],
             registry=self.registry
         )
         
         self.gauges['memory_usage'] = Gauge(
-            f'memory_usage_bytes_{instance_id}',
+            'memory_usage_bytes',
             'Memory usage in bytes',
             ['component'],
             registry=self.registry
         )
         
         self.gauges['cpu_usage'] = Gauge(
-            f'cpu_usage_percent_{instance_id}',
+            'cpu_usage_percent',
             'CPU usage percentage',
             ['component'],
             registry=self.registry
@@ -130,7 +125,7 @@ class MetricsCollector:
         
         if self.config.monitoring.enabled:
             # Start Prometheus HTTP server
-            start_http_server(self.config.monitoring.prometheus.port)
+            start_http_server(self.config.monitoring.prometheus.port, registry=self.registry)
             self.logger.info(f"Prometheus metrics server started on port {self.config.monitoring.prometheus.port}")
     
     async def start(self):
@@ -139,25 +134,40 @@ class MetricsCollector:
         self.is_running = True
         
         # Start metrics collection tasks
-        asyncio.create_task(self._collect_system_metrics())
-        asyncio.create_task(self._log_metrics_summary())
+        self._tasks = [
+            asyncio.create_task(self._collect_system_metrics()),
+            asyncio.create_task(self._log_metrics_summary()),
+        ]
     
     async def stop(self):
         """Stop metrics collection"""
         self.logger.info("Stopping metrics collection...")
         self.is_running = False
+
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
     
-    async def increment_counter(self, metric_name: str, labels: Dict[str, str] = None, value: float = 1):
+    async def increment_counter(self, metric_name: str, labels: Optional[Dict[str, str]] = None, value: float = 1):
         """Increment a counter metric"""
         # Update internal counter
         self.counter_data[metric_name] += value
         
         # Update Prometheus counter if it exists
         if metric_name in self.counters:
-            if labels:
-                self.counters[metric_name].labels(**labels).inc(value)
-            else:
-                self.counters[metric_name].inc(value)
+            counter = self.counters[metric_name]
+            resolved_labels = labels or {}
+            if metric_name == 'messages_processed':
+                resolved_labels.setdefault('exchange', 'unknown')
+                resolved_labels.setdefault('type', 'unknown')
+            elif metric_name == 'processing_errors':
+                resolved_labels.setdefault('exchange', 'unknown')
+                resolved_labels.setdefault('error_type', 'general')
+            elif metric_name == 'reconnects':
+                resolved_labels.setdefault('exchange', 'unknown')
+            counter.labels(**resolved_labels).inc(value)
         
         # Handle specific counter names without labels for convenience
         elif any(key in metric_name for key in ['binance', 'coinbase', 'kraken']):
@@ -192,7 +202,7 @@ class MetricsCollector:
             storage_type = operation.split('_')[0]
             self.histograms['storage_latency'].labels(storage_type=storage_type).observe(latency_seconds)
     
-    async def record_gauge(self, metric_name: str, value: float, labels: Dict[str, str] = None):
+    async def record_gauge(self, metric_name: str, value: float, labels: Optional[Dict[str, str]] = None):
         """Record gauge metric"""
         # Update internal gauge
         self.gauge_data[metric_name] = value
@@ -203,6 +213,9 @@ class MetricsCollector:
             self.gauges['buffer_depth'].labels(buffer_type=buffer_type).set(value)
         elif metric_name == 'pipeline_status':
             self.gauges['connection_status'].labels(exchange='pipeline').set(value)
+        elif metric_name.startswith("connection_status_"):
+            exchange = metric_name.replace("connection_status_", "")
+            self.gauges['connection_status'].labels(exchange=exchange).set(value)
         elif 'queue_depth' in metric_name:
             component = labels.get('component', 'default') if labels else 'default'
             self.gauges['queue_depth'].labels(component=component).set(value)
@@ -282,11 +295,11 @@ class MetricsCollector:
                 processing_stats = await self.get_latency_stats('message_processing')
                 
                 self.logger.info(
-                    "Metrics Summary",
-                    total_messages=total_messages,
-                    total_errors=total_errors,
-                    processing_latency_p95=processing_stats.get('p95', 0),
-                    buffer_depth=self.gauge_data.get('buffer_depth', 0)
+                    "Metrics Summary total_messages=%s total_errors=%s processing_latency_p95_us=%.2f buffer_depth=%s",
+                    total_messages,
+                    total_errors,
+                    float(processing_stats.get('p95', 0)),
+                    self.gauge_data.get('buffer_depth', 0),
                 )
                 
             except Exception as e:
@@ -294,11 +307,45 @@ class MetricsCollector:
     
     def get_all_metrics(self) -> Dict[str, Any]:
         """Get all current metrics"""
+        total_messages = sum(
+            count for name, count in self.counter_data.items()
+            if "processed" in name
+        )
+        total_errors = sum(
+            count for name, count in self.counter_data.items()
+            if "error" in name
+        )
+
+        processing_stats = {}
+        if self.latency_data.get("message_processing"):
+            latencies = sorted(self.latency_data["message_processing"])
+            n = len(latencies)
+            if n > 0:
+                processing_stats = {
+                    "count": n,
+                    "min": latencies[0],
+                    "max": latencies[-1],
+                    "mean": sum(latencies) / n,
+                    "p50": latencies[int(n * 0.5)],
+                    "p95": latencies[int(n * 0.95)],
+                    "p99": latencies[int(n * 0.99)],
+                }
+
+        connection_status = {
+            key.replace("connection_status_", ""): value
+            for key, value in self.gauge_data.items()
+            if key.startswith("connection_status_")
+        }
+        if "pipeline_status" in self.gauge_data:
+            connection_status["pipeline"] = self.gauge_data["pipeline_status"]
+
         return {
+            "messages_processed_total": int(total_messages),
+            "processing_latency_ms": float(processing_stats.get("p95", 0.0)) / 1000.0,
+            "error_count_total": int(total_errors),
+            "connection_status": connection_status,
+            "queue_depth": int(self.gauge_data.get("buffer_depth", 0)),
             'counters': dict(self.counter_data),
             'gauges': dict(self.gauge_data),
-            'latency_stats': {
-                operation: asyncio.create_task(self.get_latency_stats(operation))
-                for operation in self.latency_data.keys()
-            }
+            "latency_stats": processing_stats,
         }

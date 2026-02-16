@@ -3,14 +3,12 @@ FastAPI server for the Real-Time Market Data Pipeline
 Provides REST API endpoints and WebSocket connections for market data
 """
 
-import asyncio
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -41,9 +39,9 @@ class TradeData(BaseModel):
     """Trade data response"""
     symbol: str
     price: float
-    size: float
+    quantity: float
     side: str
-    timestamp: int
+    timestamp: datetime
     exchange: str
 
 
@@ -58,8 +56,8 @@ class OrderBookData(BaseModel):
     symbol: str
     bids: List[OrderBookLevel]
     asks: List[OrderBookLevel]
-    timestamp: int
-    sequence: int
+    timestamp: datetime
+    sequence: Optional[int] = None
 
 
 class MetricsResponse(BaseModel):
@@ -67,7 +65,7 @@ class MetricsResponse(BaseModel):
     messages_processed: int
     processing_latency_ms: float
     error_count: int
-    connection_status: Dict[str, str]
+    connection_status: Dict[str, float]
     queue_depth: int
 
 
@@ -139,6 +137,7 @@ def create_app(
     
     # WebSocket manager
     websocket_manager = WebSocketManager()
+    started_at = datetime.now(timezone.utc)
     
     # Store dependencies
     app.state.config = config
@@ -162,7 +161,7 @@ def create_app(
             status="healthy",
             timestamp=datetime.now(timezone.utc),
             version="1.0.0",
-            uptime=0.0  # TODO: Implement actual uptime tracking
+            uptime=(datetime.now(timezone.utc) - started_at).total_seconds(),
         )
     
     @app.get("/metrics", response_model=MetricsResponse)
@@ -192,56 +191,77 @@ def create_app(
             for exchange_name, exchange_config in config.exchanges.model_dump().items():
                 if exchange_config.get('enabled', False):
                     for symbol in exchange_config.get('symbols', []):
+                        if '-' in symbol:
+                            base_currency, quote_currency = symbol.split('-', 1)
+                        elif '/' in symbol:
+                            base_currency, quote_currency = symbol.split('/', 1)
+                        else:
+                            base_currency, quote_currency = symbol[:3], symbol[3:]
                         symbols.append(SymbolInfo(
                             symbol=symbol,
                             exchange=exchange_name,
-                            base_currency=symbol.split('-')[0] if '-' in symbol else symbol[:3],
-                            quote_currency=symbol.split('-')[1] if '-' in symbol else symbol[3:],
+                            base_currency=base_currency,
+                            quote_currency=quote_currency,
                             status="active"
                         ))
-            
+
+            if not symbols:
+                logging.warning(
+                    "No symbols configured. Check config.yaml path and exchange symbol settings."
+                )
+
             return symbols
         except Exception as e:
             logging.error(f"Error getting symbols: {e}")
             raise HTTPException(status_code=500, detail="Failed to retrieve symbols")
     
     @app.get("/trades/{symbol}", response_model=List[TradeData])
-    async def get_recent_trades(symbol: str, limit: int = 100):
+    async def get_recent_trades(
+        symbol: str,
+        exchange: str = Query(default="coinbase"),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
         """Get recent trades for a symbol"""
         try:
-            # Get latest trade from storage manager
-            trade = await storage_manager.get_latest_trade("coinbase", symbol)
-            
-            if trade:
-                return [TradeData(
+            trades = await storage_manager.get_recent_trades(
+                exchange=exchange,
+                symbol=symbol,
+                limit=limit,
+            )
+
+            return [
+                TradeData(
                     symbol=trade.get("symbol", symbol),
                     price=trade.get("price", 0.0),
-                    size=trade.get("size", 0.0),
+                    quantity=trade.get("quantity", trade.get("size", 0.0)),
                     side=trade.get("side", "unknown"),
-                    timestamp=trade.get("timestamp", 0),
-                    exchange=trade.get("exchange", "coinbase")
-                )]
-            else:
-                return []
+                    timestamp=trade.get("timestamp"),
+                    exchange=trade.get("exchange", exchange),
+                )
+                for trade in trades
+            ]
         except Exception as e:
             logging.error(f"Error getting trades for {symbol}: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to retrieve trades for {symbol}")
     
     @app.get("/orderbook/{symbol}", response_model=OrderBookData)
-    async def get_orderbook(symbol: str):
+    async def get_orderbook(symbol: str, exchange: str = Query(default="coinbase")):
         """Get current order book for a symbol"""
         try:
-            orderbook = await storage_manager.get_latest_orderbook("coinbase", symbol)
+            orderbook = await storage_manager.get_latest_orderbook(exchange, symbol)
             
             if not orderbook:
-                raise HTTPException(status_code=404, detail=f"Order book not found for {symbol}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Order book not found for {symbol} on exchange={exchange}",
+                )
             
             return OrderBookData(
                 symbol=symbol,
                 bids=[OrderBookLevel(price=level[0], size=level[1]) for level in orderbook.get("bids", [])],
                 asks=[OrderBookLevel(price=level[0], size=level[1]) for level in orderbook.get("asks", [])],
-                timestamp=orderbook.get("timestamp", 0),
-                sequence=orderbook.get("sequence", 0)
+                timestamp=orderbook.get("timestamp"),
+                sequence=orderbook.get("sequence"),
             )
         except HTTPException:
             raise
@@ -291,8 +311,20 @@ def create_app(
     return app
 
 
-async def run_server(config: Config, storage_manager: StorageManager, metrics_collector: MetricsCollector):
-    """Run the API server"""
+async def run_server(
+    config: Config,
+    storage_manager: Optional[StorageManager] = None,
+    metrics_collector: Optional[MetricsCollector] = None,
+):
+    """Run the API server with managed or shared dependencies."""
+    managed_dependencies = storage_manager is None or metrics_collector is None
+    if managed_dependencies:
+        storage_manager = StorageManager(config)
+        metrics_collector = MetricsCollector(config)
+        await storage_manager.initialize()
+        await metrics_collector.initialize()
+        await metrics_collector.start()
+
     app = create_app(config, storage_manager, metrics_collector)
     
     server_config = uvicorn.Config(
@@ -305,21 +337,20 @@ async def run_server(config: Config, storage_manager: StorageManager, metrics_co
     )
     
     server = uvicorn.Server(server_config)
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        if managed_dependencies:
+            await metrics_collector.stop()
+            await storage_manager.close()
 
 
 if __name__ == "__main__":
     # For testing the server directly
     import asyncio
-    from ..utils.config import Config
-    from ..storage.manager import StorageManager
-    from ..monitoring.metrics import MetricsCollector
     
     async def main():
         config = Config()
-        storage_manager = StorageManager(config)
-        metrics_collector = MetricsCollector(config)
-        
-        await run_server(config, storage_manager, metrics_collector)
+        await run_server(config)
     
     asyncio.run(main())

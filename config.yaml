@@ -67,10 +67,10 @@ exchanges:
     
   coinbase:
     enabled: true
-    websocket_url: "wss://ws-feed.pro.coinbase.com"
-    rest_url: "https://api.pro.coinbase.com"
+    websocket_url: "wss://ws-feed.exchange.coinbase.com"
+    rest_url: "https://api.exchange.coinbase.com"
     symbols: ["BTC-USD", "ETH-USD", "ADA-USD", "DOT-USD", "LINK-USD"]
-    channels: ["trades", "level2", "ticker"]
+    channels: ["matches", "level2", "ticker"]
     reconnect_interval: 5
     heartbeat_interval: 30
     

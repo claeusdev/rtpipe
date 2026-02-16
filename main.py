@@ -8,10 +8,8 @@ import asyncio
 import signal
 import sys
 import logging
-from typing import List
-import yaml
+from typing import Optional
 import uvicorn
-from pathlib import Path
 
 from src.api.server import create_app
 from src.processors.pipeline import DataPipeline
@@ -145,31 +143,55 @@ class MarketDataPipeline:
         self.shutdown_event.set()
 
 
-async def run_api_server(config: Config):
-    """Run the API server"""
+async def run_api_server(
+    config: Config,
+    storage_manager: Optional[StorageManager] = None,
+    metrics_collector: Optional[MetricsCollector] = None,
+    shutdown_event: Optional[asyncio.Event] = None,
+):
+    """Run the API server with managed or shared dependencies."""
+    managed_dependencies = storage_manager is None or metrics_collector is None
+
+    if managed_dependencies:
+        storage_manager = StorageManager(config)
+        metrics_collector = MetricsCollector(config)
+        await storage_manager.initialize()
+        await metrics_collector.initialize()
+        await metrics_collector.start()
+
+    app = create_app(
+        config=config,
+        storage_manager=storage_manager,
+        metrics_collector=metrics_collector,
+    )
+
     server_config = uvicorn.Config(
-        "main:create_api_app",
+        app,
         host=config.api.host,
         port=config.api.port,
         workers=1,  # Use 1 worker for async app
         log_level=config.logging.level.lower(),
-        reload=config.api.reload
+        reload=config.api.reload,
     )
     server = uvicorn.Server(server_config)
-    await server.serve()
 
+    shutdown_task = None
+    if shutdown_event:
+        async def _watch_shutdown():
+            await shutdown_event.wait()
+            server.should_exit = True
+        shutdown_task = asyncio.create_task(_watch_shutdown())
 
-def create_api_app():
-    """Factory function for API app (used by uvicorn)"""
-    config = Config("config.yaml")
-    storage_manager = StorageManager(config)
-    metrics_collector = MetricsCollector(config)
-    
-    return create_app(
-        config=config,
-        storage_manager=storage_manager,
-        metrics_collector=metrics_collector
-    )
+    try:
+        await server.serve()
+    finally:
+        if shutdown_task:
+            shutdown_task.cancel()
+            await asyncio.gather(shutdown_task, return_exceptions=True)
+
+        if managed_dependencies:
+            await metrics_collector.stop()
+            await storage_manager.close()
 
 
 async def main():
@@ -221,17 +243,23 @@ async def main():
             
         else:  # both
             # Run both pipeline and API server
-            config = Config(args.config)
             pipeline = MarketDataPipeline(args.config)
             
             # Setup signal handlers
             signal.signal(signal.SIGINT, pipeline.signal_handler)
             signal.signal(signal.SIGTERM, pipeline.signal_handler)
-            
-            # Start both pipeline and API server
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(pipeline.run())
-                tg.create_task(run_api_server(config))
+
+            await pipeline.initialize()
+            await pipeline.start()
+            try:
+                await run_api_server(
+                    config=pipeline.config,
+                    storage_manager=pipeline.storage_manager,
+                    metrics_collector=pipeline.metrics_collector,
+                    shutdown_event=pipeline.shutdown_event,
+                )
+            finally:
+                await pipeline.stop()
                 
     except KeyboardInterrupt:
         logging.info("Received keyboard interrupt, shutting down...")

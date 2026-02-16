@@ -2,18 +2,16 @@
 Storage manager for market data persistence
 """
 
-import asyncio
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 
 import redis.asyncio as redis
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
 from influxdb_client import Point, WritePrecision
-from influxdb_client.client.write_api_async import WriteApiAsync
 
-from ..models.market_data import Trade, Quote, OrderBook, MarketDataMessage
+from ..models.market_data import Trade, Quote, OrderBook
 
 
 class StorageManager:
@@ -32,6 +30,18 @@ class StorageManager:
         self.influx_buffer = []
         self.buffer_size = config.influxdb.batch_size
         self.last_flush = datetime.utcnow()
+
+    @staticmethod
+    def _enum_value(value: Any) -> Any:
+        """Return `.value` for Enum-like objects, otherwise raw value."""
+        return getattr(value, "value", value)
+
+    @staticmethod
+    def _loads_json(raw: Any) -> Dict[str, Any]:
+        """Decode JSON payloads from Redis bytes/str into dicts."""
+        if isinstance(raw, (bytes, bytearray)):
+            return json.loads(raw.decode("utf-8"))
+        return json.loads(raw)
         
     async def initialize(self):
         """Initialize storage connections"""
@@ -88,19 +98,12 @@ class StorageManager:
     async def store_trades(self, trades: List[Trade]):
         """Store trade data to both Redis and InfluxDB"""
         try:
-            # Store to Redis for fast access
-            redis_tasks = []
+            # Store to Redis using a single batched pipeline connection.
+            await self._store_trades_to_redis_batch(trades)
+
+            # Store to InfluxDB for historical data.
             for trade in trades:
-                redis_tasks.append(self._store_trade_to_redis(trade))
-            
-            # Store to InfluxDB for historical data
-            influx_tasks = []
-            for trade in trades:
-                influx_tasks.append(self._add_trade_to_influx_buffer(trade))
-            
-            # Execute storage operations
-            await asyncio.gather(*redis_tasks, return_exceptions=True)
-            await asyncio.gather(*influx_tasks, return_exceptions=True)
+                await self._add_trade_to_influx_buffer(trade)
             
             # Flush InfluxDB buffer if needed
             await self._check_and_flush_influx_buffer()
@@ -114,19 +117,12 @@ class StorageManager:
     async def store_quotes(self, quotes: List[Quote]):
         """Store quote data to both Redis and InfluxDB"""
         try:
-            # Store to Redis for fast access
-            redis_tasks = []
+            # Store to Redis using a single batched pipeline connection.
+            await self._store_quotes_to_redis_batch(quotes)
+
+            # Store to InfluxDB for historical data.
             for quote in quotes:
-                redis_tasks.append(self._store_quote_to_redis(quote))
-            
-            # Store to InfluxDB for historical data
-            influx_tasks = []
-            for quote in quotes:
-                influx_tasks.append(self._add_quote_to_influx_buffer(quote))
-            
-            # Execute storage operations
-            await asyncio.gather(*redis_tasks, return_exceptions=True)
-            await asyncio.gather(*influx_tasks, return_exceptions=True)
+                await self._add_quote_to_influx_buffer(quote)
             
             # Flush InfluxDB buffer if needed
             await self._check_and_flush_influx_buffer()
@@ -140,19 +136,12 @@ class StorageManager:
     async def store_orderbooks(self, orderbooks: List[OrderBook]):
         """Store order book data to both Redis and InfluxDB"""
         try:
-            # Store to Redis for fast access
-            redis_tasks = []
+            # Store to Redis using a single batched pipeline connection.
+            await self._store_orderbooks_to_redis_batch(orderbooks)
+
+            # Store to InfluxDB for historical data.
             for orderbook in orderbooks:
-                redis_tasks.append(self._store_orderbook_to_redis(orderbook))
-            
-            # Store to InfluxDB for historical data
-            influx_tasks = []
-            for orderbook in orderbooks:
-                influx_tasks.append(self._add_orderbook_to_influx_buffer(orderbook))
-            
-            # Execute storage operations
-            await asyncio.gather(*redis_tasks, return_exceptions=True)
-            await asyncio.gather(*influx_tasks, return_exceptions=True)
+                await self._add_orderbook_to_influx_buffer(orderbook)
             
             # Flush InfluxDB buffer if needed
             await self._check_and_flush_influx_buffer()
@@ -165,14 +154,16 @@ class StorageManager:
     
     async def _store_trade_to_redis(self, trade: Trade):
         """Store trade to Redis with TTL"""
-        key = f"trade:{trade.exchange}:{trade.symbol}:{trade.trade_id}"
+        exchange = self._enum_value(trade.exchange)
+        side = self._enum_value(trade.side)
+        key = f"trade:{exchange}:{trade.symbol}:{trade.trade_id}"
         data = {
-            'exchange': trade.exchange,
+            'exchange': exchange,
             'symbol': trade.symbol,
             'trade_id': trade.trade_id,
             'price': float(trade.price),
             'quantity': float(trade.quantity),
-            'side': trade.side,
+            'side': side,
             'timestamp': trade.timestamp.isoformat(),
             'buyer_maker': trade.buyer_maker
         }
@@ -184,16 +175,45 @@ class StorageManager:
         )
         
         # Also add to recent trades list
-        recent_key = f"recent_trades:{trade.exchange}:{trade.symbol}"
+        recent_key = f"recent_trades:{exchange}:{trade.symbol}"
         await self.redis_client.lpush(recent_key, json.dumps(data))
         await self.redis_client.ltrim(recent_key, 0, 999)  # Keep last 1000 trades
         await self.redis_client.expire(recent_key, self.config.redis.ttl.trades)
+
+    async def _store_trades_to_redis_batch(self, trades: List[Trade]):
+        """Store many trades with one Redis pipeline execution."""
+        if not trades:
+            return
+
+        pipe = self.redis_client.pipeline(transaction=False)
+        for trade in trades:
+            exchange = self._enum_value(trade.exchange)
+            side = self._enum_value(trade.side)
+            key = f"trade:{exchange}:{trade.symbol}:{trade.trade_id}"
+            data = {
+                'exchange': exchange,
+                'symbol': trade.symbol,
+                'trade_id': trade.trade_id,
+                'price': float(trade.price),
+                'quantity': float(trade.quantity),
+                'side': side,
+                'timestamp': trade.timestamp.isoformat(),
+                'buyer_maker': trade.buyer_maker
+            }
+            serialized = json.dumps(data)
+            pipe.setex(key, self.config.redis.ttl.trades, serialized)
+            recent_key = f"recent_trades:{exchange}:{trade.symbol}"
+            pipe.lpush(recent_key, serialized)
+            pipe.ltrim(recent_key, 0, 999)
+            pipe.expire(recent_key, self.config.redis.ttl.trades)
+        await pipe.execute()
     
     async def _store_quote_to_redis(self, quote: Quote):
         """Store quote to Redis with TTL"""
-        key = f"quote:{quote.exchange}:{quote.symbol}"
+        exchange = self._enum_value(quote.exchange)
+        key = f"quote:{exchange}:{quote.symbol}"
         data = {
-            'exchange': quote.exchange,
+            'exchange': exchange,
             'symbol': quote.symbol,
             'bid_price': float(quote.bid_price),
             'bid_quantity': float(quote.bid_quantity),
@@ -209,12 +229,36 @@ class StorageManager:
             self.config.redis.ttl.quotes, 
             json.dumps(data)
         )
+
+    async def _store_quotes_to_redis_batch(self, quotes: List[Quote]):
+        """Store many quotes with one Redis pipeline execution."""
+        if not quotes:
+            return
+
+        pipe = self.redis_client.pipeline(transaction=False)
+        for quote in quotes:
+            exchange = self._enum_value(quote.exchange)
+            key = f"quote:{exchange}:{quote.symbol}"
+            data = {
+                'exchange': exchange,
+                'symbol': quote.symbol,
+                'bid_price': float(quote.bid_price),
+                'bid_quantity': float(quote.bid_quantity),
+                'ask_price': float(quote.ask_price),
+                'ask_quantity': float(quote.ask_quantity),
+                'timestamp': quote.timestamp.isoformat(),
+                'spread': float(quote.spread),
+                'mid_price': float(quote.mid_price)
+            }
+            pipe.setex(key, self.config.redis.ttl.quotes, json.dumps(data))
+        await pipe.execute()
     
     async def _store_orderbook_to_redis(self, orderbook: OrderBook):
         """Store order book to Redis with TTL"""
-        key = f"orderbook:{orderbook.exchange}:{orderbook.symbol}"
+        exchange = self._enum_value(orderbook.exchange)
+        key = f"orderbook:{exchange}:{orderbook.symbol}"
         data = {
-            'exchange': orderbook.exchange,
+            'exchange': exchange,
             'symbol': orderbook.symbol,
             'bids': [[float(level.price), float(level.quantity)] for level in orderbook.bids[:20]],
             'asks': [[float(level.price), float(level.quantity)] for level in orderbook.asks[:20]],
@@ -233,13 +277,40 @@ class StorageManager:
             self.config.redis.ttl.orderbook, 
             json.dumps(data)
         )
+
+    async def _store_orderbooks_to_redis_batch(self, orderbooks: List[OrderBook]):
+        """Store many order books with one Redis pipeline execution."""
+        if not orderbooks:
+            return
+
+        pipe = self.redis_client.pipeline(transaction=False)
+        for orderbook in orderbooks:
+            exchange = self._enum_value(orderbook.exchange)
+            key = f"orderbook:{exchange}:{orderbook.symbol}"
+            data = {
+                'exchange': exchange,
+                'symbol': orderbook.symbol,
+                'bids': [[float(level.price), float(level.quantity)] for level in orderbook.bids[:20]],
+                'asks': [[float(level.price), float(level.quantity)] for level in orderbook.asks[:20]],
+                'timestamp': orderbook.timestamp.isoformat(),
+                'is_snapshot': orderbook.is_snapshot
+            }
+            if orderbook.best_bid and orderbook.best_ask:
+                data['best_bid'] = float(orderbook.best_bid.price)
+                data['best_ask'] = float(orderbook.best_ask.price)
+                data['spread'] = float(orderbook.spread) if orderbook.spread else None
+                data['mid_price'] = float(orderbook.mid_price) if orderbook.mid_price else None
+            pipe.setex(key, self.config.redis.ttl.orderbook, json.dumps(data))
+        await pipe.execute()
     
     async def _add_trade_to_influx_buffer(self, trade: Trade):
         """Add trade to InfluxDB buffer"""
+        exchange = self._enum_value(trade.exchange)
+        side = self._enum_value(trade.side)
         point = Point("trades") \
-            .tag("exchange", trade.exchange) \
+            .tag("exchange", exchange) \
             .tag("symbol", trade.symbol) \
-            .tag("side", trade.side) \
+            .tag("side", side) \
             .field("price", float(trade.price)) \
             .field("quantity", float(trade.quantity)) \
             .field("notional", float(trade.notional)) \
@@ -252,8 +323,9 @@ class StorageManager:
     
     async def _add_quote_to_influx_buffer(self, quote: Quote):
         """Add quote to InfluxDB buffer"""
+        exchange = self._enum_value(quote.exchange)
         point = Point("quotes") \
-            .tag("exchange", quote.exchange) \
+            .tag("exchange", exchange) \
             .tag("symbol", quote.symbol) \
             .field("bid_price", float(quote.bid_price)) \
             .field("bid_quantity", float(quote.bid_quantity)) \
@@ -269,15 +341,18 @@ class StorageManager:
     async def _add_orderbook_to_influx_buffer(self, orderbook: OrderBook):
         """Add order book to InfluxDB buffer"""
         if orderbook.best_bid and orderbook.best_ask:
+            spread_value = float(orderbook.spread) if orderbook.spread is not None else 0.0
+            mid_price_value = float(orderbook.mid_price) if orderbook.mid_price is not None else 0.0
+            exchange = self._enum_value(orderbook.exchange)
             point = Point("orderbooks") \
-                .tag("exchange", orderbook.exchange) \
+                .tag("exchange", exchange) \
                 .tag("symbol", orderbook.symbol) \
                 .field("best_bid", float(orderbook.best_bid.price)) \
                 .field("best_ask", float(orderbook.best_ask.price)) \
                 .field("bid_quantity", float(orderbook.best_bid.quantity)) \
                 .field("ask_quantity", float(orderbook.best_ask.quantity)) \
-                .field("spread", float(orderbook.spread) if orderbook.spread else 0) \
-                .field("mid_price", float(orderbook.mid_price) if orderbook.mid_price else 0) \
+                .field("spread", spread_value) \
+                .field("mid_price", mid_price_value) \
                 .field("bid_volume_5", float(orderbook.total_bid_volume(5))) \
                 .field("ask_volume_5", float(orderbook.total_ask_volume(5))) \
                 .time(orderbook.timestamp, WritePrecision.NS)
@@ -314,21 +389,24 @@ class StorageManager:
     
     async def get_latest_trade(self, exchange: str, symbol: str) -> Optional[Dict]:
         """Get latest trade from Redis"""
+        recent_trades = await self.get_recent_trades(exchange=exchange, symbol=symbol, limit=1)
+        return recent_trades[0] if recent_trades else None
+
+    async def get_recent_trades(self, exchange: str, symbol: str, limit: int = 100) -> List[Dict]:
+        """Get recent trades for an exchange/symbol pair from Redis."""
         try:
             if not self.redis_client:
                 self.logger.warning("Redis client not initialized")
-                return None
+                return []
                 
             recent_key = f"recent_trades:{exchange}:{symbol}"
-            data = await self.redis_client.lindex(recent_key, 0)
+            data = await self.redis_client.lrange(recent_key, 0, max(limit - 1, 0))
             
-            if data:
-                return json.loads(data)
-            return None
+            return [self._loads_json(item) for item in data] if data else []
             
         except Exception as e:
-            self.logger.error(f"Error getting latest trade: {e}")
-            return None
+            self.logger.error(f"Error getting recent trades: {e}")
+            return []
     
     async def get_latest_quote(self, exchange: str, symbol: str) -> Optional[Dict]:
         """Get latest quote from Redis"""
@@ -341,7 +419,7 @@ class StorageManager:
             data = await self.redis_client.get(key)
             
             if data:
-                return json.loads(data)
+                return self._loads_json(data)
             return None
             
         except Exception as e:
@@ -359,7 +437,7 @@ class StorageManager:
             data = await self.redis_client.get(key)
             
             if data:
-                return json.loads(data)
+                return self._loads_json(data)
             return None
             
         except Exception as e:

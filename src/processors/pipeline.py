@@ -10,7 +10,6 @@ from datetime import datetime
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import orjson
-import redis.asyncio as redis
 
 from ..models.market_data import MarketDataMessage, Trade, Quote, OrderBook, MessageType
 
@@ -36,6 +35,7 @@ class DataPipeline:
         self.message_buffer = []
         self.buffer_size = config.processing.batch_size
         self.last_flush = time.time()
+        self._flush_lock = asyncio.Lock()
         
     async def initialize(self):
         """Initialize the data pipeline"""
@@ -158,6 +158,7 @@ class DataPipeline:
     
     def _parse_trade_message(self, data: Dict[str, Any]) -> Trade:
         """Parse trade message"""
+        timestamp = str(data.get('timestamp', datetime.utcnow().isoformat()))
         return Trade(
             exchange=data.get('exchange'),
             symbol=data.get('symbol'),
@@ -165,12 +166,13 @@ class DataPipeline:
             price=data.get('price'),
             quantity=data.get('quantity'),
             side=data.get('side'),
-            timestamp=datetime.fromisoformat(data.get('timestamp', datetime.utcnow().isoformat())),
+            timestamp=datetime.fromisoformat(timestamp.replace('Z', '+00:00')),
             buyer_maker=data.get('buyer_maker')
         )
     
     def _parse_quote_message(self, data: Dict[str, Any]) -> Quote:
         """Parse quote message"""
+        timestamp = str(data.get('timestamp', datetime.utcnow().isoformat()))
         return Quote(
             exchange=data.get('exchange'),
             symbol=data.get('symbol'),
@@ -178,67 +180,103 @@ class DataPipeline:
             bid_quantity=data.get('bid_quantity'),
             ask_price=data.get('ask_price'),
             ask_quantity=data.get('ask_quantity'),
-            timestamp=datetime.fromisoformat(data.get('timestamp', datetime.utcnow().isoformat()))
+            timestamp=datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
         )
     
     def _parse_orderbook_message(self, data: Dict[str, Any]) -> OrderBook:
         """Parse order book message"""
+        timestamp = str(data.get('timestamp', datetime.utcnow().isoformat()))
         return OrderBook(
             exchange=data.get('exchange'),
             symbol=data.get('symbol'),
             bids=data.get('bids', []),
             asks=data.get('asks', []),
             is_snapshot=data.get('is_snapshot', False),
-            timestamp=datetime.fromisoformat(data.get('timestamp', datetime.utcnow().isoformat()))
+            timestamp=datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
         )
+
+    def _infer_message_type(self, data: Dict[str, Any]) -> Optional[MessageType]:
+        """Infer message type for direct (non-Kafka) payloads."""
+        message_type = data.get("message_type")
+        if message_type:
+            try:
+                return MessageType(str(message_type))
+            except ValueError:
+                self.logger.warning("Unknown message_type field: %s", message_type)
+
+        if "trade_id" in data:
+            return MessageType.TRADE
+        if "bid_price" in data and "ask_price" in data:
+            return MessageType.QUOTE
+        if "bids" in data and "asks" in data:
+            return MessageType.ORDER_BOOK
+        return None
+
+    async def _process_direct_message(self, data: Dict[str, Any]) -> Optional[MarketDataMessage]:
+        """Process direct payloads produced by exchange connectors."""
+        message_type = self._infer_message_type(data)
+        if message_type == MessageType.TRADE:
+            return self._parse_trade_message(data)
+        if message_type == MessageType.QUOTE:
+            return self._parse_quote_message(data)
+        if message_type == MessageType.ORDER_BOOK:
+            return self._parse_orderbook_message(data)
+
+        self.logger.warning("Unable to infer direct message type from payload keys")
+        return None
     
-    async def _flush_buffer(self):
+    async def _flush_buffer(self) -> bool:
         """Flush message buffer to storage"""
-        if not self.message_buffer:
-            return
-        
-        start_time = time.time()
-        
-        try:
-            # Group messages by type
-            trades = []
-            quotes = []
-            orderbooks = []
-            
-            for message in self.message_buffer:
-                if message.message_type == MessageType.TRADE:
-                    trades.append(message)
-                elif message.message_type == MessageType.QUOTE:
-                    quotes.append(message)
-                elif message.message_type == MessageType.ORDER_BOOK:
-                    orderbooks.append(message)
-            
-            # Store in parallel
-            storage_tasks = []
-            if trades:
-                storage_tasks.append(self.storage_manager.store_trades(trades))
-            if quotes:
-                storage_tasks.append(self.storage_manager.store_quotes(quotes))
-            if orderbooks:
-                storage_tasks.append(self.storage_manager.store_orderbooks(orderbooks))
-            
-            if storage_tasks:
-                await asyncio.gather(*storage_tasks, return_exceptions=True)
-            
-            # Clear buffer
-            message_count = len(self.message_buffer)
-            self.message_buffer.clear()
-            self.last_flush = time.time()
-            
-            # Record metrics
-            flush_latency = (time.time() - start_time) * 1000000  # microseconds
-            await self.metrics_collector.record_latency('buffer_flush', flush_latency)
-            await self.metrics_collector.record_gauge('messages_flushed', message_count)
-            
-            self.logger.debug(f"Flushed {message_count} messages in {flush_latency:.2f}μs")
-            
-        except Exception as e:
-            self.logger.error(f"Error flushing buffer: {e}")
+        async with self._flush_lock:
+            if not self.message_buffer:
+                return True
+
+            start_time = time.time()
+            buffer_to_flush = list(self.message_buffer)
+
+            try:
+                # Group messages by type
+                trades = []
+                quotes = []
+                orderbooks = []
+
+                for message in buffer_to_flush:
+                    if message.message_type == MessageType.TRADE:
+                        trades.append(message)
+                    elif message.message_type == MessageType.QUOTE:
+                        quotes.append(message)
+                    elif message.message_type == MessageType.ORDER_BOOK:
+                        orderbooks.append(message)
+
+                # Store in parallel and fail fast if any backend errors.
+                storage_tasks = []
+                if trades:
+                    storage_tasks.append(self.storage_manager.store_trades(trades))
+                if quotes:
+                    storage_tasks.append(self.storage_manager.store_quotes(quotes))
+                if orderbooks:
+                    storage_tasks.append(self.storage_manager.store_orderbooks(orderbooks))
+
+                if storage_tasks:
+                    await asyncio.gather(*storage_tasks)
+
+                # Remove only the messages we successfully flushed.
+                del self.message_buffer[:len(buffer_to_flush)]
+                message_count = len(buffer_to_flush)
+                self.last_flush = time.time()
+
+                # Record metrics
+                flush_latency = (time.time() - start_time) * 1000000  # microseconds
+                await self.metrics_collector.record_latency('buffer_flush', flush_latency)
+                await self.metrics_collector.record_gauge('messages_flushed', message_count)
+
+                self.logger.debug(f"Flushed {message_count} messages in {flush_latency:.2f}μs")
+                return True
+
+            except Exception as e:
+                self.logger.error("Error flushing buffer: %s", e)
+                await self.metrics_collector.increment_counter('processing_errors')
+                return False
     
     async def _flush_buffer_periodically(self):
         """Periodically flush buffer based on time interval"""
@@ -277,12 +315,13 @@ class DataPipeline:
                 self.logger.error(f"Error updating metrics: {e}")
     
     async def process_single_message(self, message_data: Dict[str, Any]) -> bool:
-        """Process a single message (for testing)"""
+        """Process a single direct message from exchange connectors."""
         try:
-            processed = await self._process_message('test', message_data)
+            processed = await self._process_direct_message(message_data)
             if processed:
                 self.message_buffer.append(processed)
-                await self._flush_buffer()
+                if len(self.message_buffer) >= self.buffer_size:
+                    return await self._flush_buffer()
                 return True
             return False
         except Exception as e:

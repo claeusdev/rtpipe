@@ -9,6 +9,8 @@ High-performance real-time market data processing system designed for low-latenc
 Market Data Sources → WebSocket Client → Kafka → Stream Processor → InfluxDB/Redis → API/Dashboard
 ```
 
+Detailed architecture and design notes: [`docs/architecture.md`](docs/architecture.md)
+
 ### Components
 - **Data Ingestion**: WebSocket clients for multiple exchanges
 - **Message Queue**: Apache Kafka for reliable data streaming

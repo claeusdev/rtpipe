@@ -5,7 +5,8 @@ Configuration management for the pipeline
 import yaml
 from pathlib import Path
 from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field
+import warnings
+from pydantic import BaseModel, Field, PrivateAttr
 from pydantic_settings import BaseSettings
 
 
@@ -95,9 +96,9 @@ class BinanceConfig(ExchangeConfig):
 
 class CoinbaseConfig(ExchangeConfig):
     """Coinbase specific configuration"""
-    websocket_url: str = "wss://ws-feed.pro.coinbase.com"
-    rest_url: str = "https://api.pro.coinbase.com"
-    channels: list[str] = ["trades", "level2", "ticker"]
+    websocket_url: str = "wss://ws-feed.exchange.coinbase.com"
+    rest_url: str = "https://api.exchange.coinbase.com"
+    channels: list[str] = ["matches", "level2", "ticker"]
 
 
 class KrakenConfig(ExchangeConfig):
@@ -251,22 +252,42 @@ class Config(BaseSettings):
     performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     development: DevelopmentConfig = Field(default_factory=DevelopmentConfig)
+    _loaded_config_path: Optional[str] = PrivateAttr(default=None)
     
     def __init__(self, config_path: str = "config.yaml", **kwargs):
         """Initialize configuration from file and environment variables"""
-        
-        # Load from YAML file if it exists
-        config_data = {}
-        config_file = Path(config_path)
-        
-        if config_file.exists():
-            with open(config_file, 'r') as f:
+
+        # Load YAML config from a robust set of candidate paths.
+        config_data: Dict[str, Any] = {}
+        requested_path = Path(config_path)
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = [requested_path]
+        if not requested_path.is_absolute():
+            candidates.append(repo_root / requested_path)
+
+        selected_path = next((path for path in candidates if path.exists()), None)
+        loaded_config_path = str(selected_path) if selected_path else None
+
+        if selected_path:
+            with open(selected_path, "r", encoding="utf-8") as f:
                 config_data = yaml.safe_load(f) or {}
+        else:
+            warnings.warn(
+                f"Config file '{config_path}' not found; using model defaults.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         
         # Merge with any passed kwargs
         config_data.update(kwargs)
         
         super().__init__(**config_data)
+        self._loaded_config_path = loaded_config_path
+
+    @property
+    def loaded_config_path(self) -> Optional[str]:
+        """Filesystem path of the loaded config file, if any."""
+        return self._loaded_config_path
     
     def get_enabled_exchanges(self) -> list[str]:
         """Get list of enabled exchanges"""

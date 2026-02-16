@@ -5,6 +5,7 @@ Exchange manager for handling multiple exchange connections
 import asyncio
 import logging
 from typing import Dict, List, Optional, Any
+import random
 import websockets
 import json
 from datetime import datetime
@@ -86,6 +87,7 @@ class BaseExchangeConnector:
         self.websocket = None
         self.is_running = False
         self.reconnect_count = 0
+        self.connection_task = None
         
     async def initialize(self):
         """Initialize connector"""
@@ -94,18 +96,26 @@ class BaseExchangeConnector:
     async def start(self):
         """Start connection"""
         self.is_running = True
-        asyncio.create_task(self._connection_loop())
+        self.connection_task = asyncio.create_task(self._connection_loop())
     
     async def stop(self):
         """Stop connection"""
         self.is_running = False
         if self.websocket:
             await self.websocket.close()
+        if self.connection_task:
+            self.connection_task.cancel()
+            await asyncio.gather(self.connection_task, return_exceptions=True)
+            self.connection_task = None
     
     async def _connection_loop(self):
         """Main connection loop with reconnection logic"""
         while self.is_running:
             try:
+                await self.metrics_collector.record_gauge(
+                    "connection_status_" + self.exchange_name,
+                    0,
+                )
                 await self._connect_and_process()
             except Exception as e:
                 self.logger.error(f"Connection error: {e}")
@@ -113,7 +123,10 @@ class BaseExchangeConnector:
                 await self.metrics_collector.increment_counter(f"{self.exchange_name}_reconnects")
                 
                 if self.is_running:
-                    await asyncio.sleep(self.config.reconnect_interval)
+                    base_delay = max(int(self.config.reconnect_interval), 1)
+                    backoff_delay = min(base_delay * (2 ** min(self.reconnect_count, 5)), 60)
+                    jitter = random.uniform(0, 0.5)
+                    await asyncio.sleep(backoff_delay + jitter)
     
     async def _connect_and_process(self):
         """Connect to exchange and process messages"""
@@ -131,6 +144,10 @@ class BaseExchangeConnector:
             
             # Reset reconnect count on successful connection
             self.reconnect_count = 0
+            await self.metrics_collector.record_gauge(
+                "connection_status_" + self.exchange_name,
+                1,
+            )
             
             # Process messages
             async for message in websocket:
@@ -138,6 +155,8 @@ class BaseExchangeConnector:
                     break
                 
                 try:
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8")
                     await self._process_message(message)
                 except Exception as e:
                     self.logger.error(f"Error processing message: {e}")
@@ -191,22 +210,25 @@ class BinanceConnector(BaseExchangeConnector):
         """Process Binance message"""
         try:
             data = json.loads(message)
-            
-            # Skip subscription confirmations
-            if "result" in data or "id" in data:
+
+            if not isinstance(data, dict):
                 return
-            
-            if "stream" not in data:
+
+            # Skip subscription confirmations.
+            if "result" in data and "id" in data:
                 return
-            
-            stream = data["stream"]
-            stream_data = data["data"]
-            
-            if "@trade" in stream:
+
+            # Binance can send either wrapped combined messages (`stream` + `data`)
+            # or raw event payloads directly when using /ws + SUBSCRIBE.
+            stream_data = data.get("data", data)
+            stream_name = data.get("stream", "")
+            event_type = stream_data.get("e", "")
+
+            if event_type == "trade" or "@trade" in stream_name:
                 await self._process_trade(stream_data)
-            elif "@depth" in stream:
+            elif event_type == "depthUpdate" or "@depth" in stream_name:
                 await self._process_depth(stream_data)
-            elif "@ticker" in stream:
+            elif event_type in ("24hrTicker", "bookTicker") or "@ticker" in stream_name:
                 await self._process_ticker(stream_data)
                 
         except Exception as e:
@@ -225,8 +247,11 @@ class BinanceConnector(BaseExchangeConnector):
             buyer_maker=data["m"]
         )
         
-        await self.data_pipeline.process_single_message(trade.to_kafka_value())
-        await self.metrics_collector.increment_counter("binance_trades_processed")
+        ok = await self.data_pipeline.process_single_message(trade.to_kafka_value())
+        if ok:
+            await self.metrics_collector.increment_counter("binance_trades_processed")
+        else:
+            await self.metrics_collector.increment_counter("binance_message_errors")
     
     async def _process_depth(self, data: Dict[str, Any]):
         """Process Binance depth message"""
@@ -239,11 +264,20 @@ class BinanceConnector(BaseExchangeConnector):
             is_snapshot=False
         )
         
-        await self.data_pipeline.process_single_message(orderbook.to_kafka_value())
-        await self.metrics_collector.increment_counter("binance_depth_processed")
+        ok = await self.data_pipeline.process_single_message(orderbook.to_kafka_value())
+        if ok:
+            await self.metrics_collector.increment_counter("binance_depth_processed")
+        else:
+            await self.metrics_collector.increment_counter("binance_message_errors")
     
     async def _process_ticker(self, data: Dict[str, Any]):
         """Process Binance ticker message"""
+        timestamp_ms = data.get("E") or data.get("T")
+        if timestamp_ms is None:
+            timestamp = datetime.utcnow()
+        else:
+            timestamp = datetime.fromtimestamp(float(timestamp_ms) / 1000)
+
         quote = Quote(
             exchange=Exchange.BINANCE,
             symbol=data["s"],
@@ -251,15 +285,29 @@ class BinanceConnector(BaseExchangeConnector):
             bid_quantity=float(data["B"]),
             ask_price=float(data["a"]),
             ask_quantity=float(data["A"]),
-            timestamp=datetime.fromtimestamp(data["E"] / 1000)
+            timestamp=timestamp
         )
         
-        await self.data_pipeline.process_single_message(quote.to_kafka_value())
-        await self.metrics_collector.increment_counter("binance_tickers_processed")
+        ok = await self.data_pipeline.process_single_message(quote.to_kafka_value())
+        if ok:
+            await self.metrics_collector.increment_counter("binance_tickers_processed")
+        else:
+            await self.metrics_collector.increment_counter("binance_message_errors")
 
 
 class CoinbaseConnector(BaseExchangeConnector):
     """Coinbase Pro WebSocket connector"""
+
+    async def initialize(self):
+        """Normalize legacy Coinbase endpoints."""
+        if "ws-feed.pro.coinbase.com" in self.config.websocket_url:
+            self.logger.warning(
+                "Legacy Coinbase WebSocket URL detected; switching to ws-feed.exchange.coinbase.com"
+            )
+            self.config.websocket_url = "wss://ws-feed.exchange.coinbase.com"
+
+        if "api.pro.coinbase.com" in self.config.rest_url:
+            self.config.rest_url = "https://api.exchange.coinbase.com"
     
     @property
     def exchange_name(self) -> str:
@@ -306,8 +354,11 @@ class CoinbaseConnector(BaseExchangeConnector):
             buyer_maker=data["side"] == "sell"  # Coinbase logic
         )
         
-        await self.data_pipeline.process_single_message(trade.to_kafka_value())
-        await self.metrics_collector.increment_counter("coinbase_trades_processed")
+        ok = await self.data_pipeline.process_single_message(trade.to_kafka_value())
+        if ok:
+            await self.metrics_collector.increment_counter("coinbase_trades_processed")
+        else:
+            await self.metrics_collector.increment_counter("coinbase_message_errors")
     
     async def _process_l2_update(self, data: Dict[str, Any]):
         """Process Coinbase L2 update message"""
@@ -334,8 +385,11 @@ class CoinbaseConnector(BaseExchangeConnector):
                 is_snapshot=False
             )
             
-            await self.data_pipeline.process_single_message(orderbook.to_kafka_value())
-            await self.metrics_collector.increment_counter("coinbase_l2_processed")
+            ok = await self.data_pipeline.process_single_message(orderbook.to_kafka_value())
+            if ok:
+                await self.metrics_collector.increment_counter("coinbase_l2_processed")
+            else:
+                await self.metrics_collector.increment_counter("coinbase_message_errors")
     
     async def _process_ticker(self, data: Dict[str, Any]):
         """Process Coinbase ticker message"""
@@ -349,8 +403,11 @@ class CoinbaseConnector(BaseExchangeConnector):
             timestamp=datetime.fromisoformat(data["time"].replace("Z", "+00:00"))
         )
         
-        await self.data_pipeline.process_single_message(quote.to_kafka_value())
-        await self.metrics_collector.increment_counter("coinbase_tickers_processed")
+        ok = await self.data_pipeline.process_single_message(quote.to_kafka_value())
+        if ok:
+            await self.metrics_collector.increment_counter("coinbase_tickers_processed")
+        else:
+            await self.metrics_collector.increment_counter("coinbase_message_errors")
 
 
 class KrakenConnector(BaseExchangeConnector):
@@ -407,5 +464,8 @@ class KrakenConnector(BaseExchangeConnector):
                 buyer_maker=None
             )
             
-            await self.data_pipeline.process_single_message(trade.to_kafka_value())
-            await self.metrics_collector.increment_counter("kraken_trades_processed")
+            ok = await self.data_pipeline.process_single_message(trade.to_kafka_value())
+            if ok:
+                await self.metrics_collector.increment_counter("kraken_trades_processed")
+            else:
+                await self.metrics_collector.increment_counter("kraken_message_errors")
